@@ -109,7 +109,11 @@ def run_sequential_sampling(dist_type, params, verbose=False):
         scale_max = params[dist_type]['scale_max']
         probs = get_likert_probs(mean, std, scale_min, scale_max)
         if verbose:
-            print(f"likert_probs: [{probs[0]:.8f}, {probs[1]:.8f}, {probs[2]:.8f}, {probs[3]:.8f}, {probs[4]:.8f}]")
+            # Format probabilities as a map of values to probabilities
+            prob_map = {i: f"{p:.4f}" for i, p in enumerate(probs, start=scale_min)}
+            print("Likert probability distribution:")
+            for value, prob in prob_map.items():
+                print(f"  {value}: {prob}")
         
         sampling_kwargs = {
             'probs': probs,
@@ -250,8 +254,8 @@ def main(dist_type):
             'scale_max': 1,
         },
         'sampling': {
-            'n0': 5,
-            'confidence': 0.8,
+            'n0': 10,
+            'confidence': 0.95,
             'min_chunk': 1,
             'max_chunk': 10,
         }
@@ -266,6 +270,12 @@ def main(dist_type):
         params[dist_type]['range'],
         (1 - params['sampling']['confidence'])
     )
+    print('True std: ', params[dist_type]['std'])
+    print('True mean: ', params[dist_type]['mean'])
+    print('Classes: ', params[dist_type]['classes'])
+    print('Range: ', params[dist_type]['range'])
+    print('Confidence: ', params['sampling']['confidence'])
+    print(f"Expected n: {params['expected_n']:.2f}")
 
     if single_run:
         # Run a single iteration with verbose output
@@ -422,7 +432,7 @@ def plot_parameter_effects(classes=9, confidence=0.95, figsize=(18, 6)):
 
 if __name__ == "__main__":
     # Add a call to the new function
-    plot_parameter_effects(classes=9)
+    # plot_parameter_effects(classes=9)
     
     main('likert')
-    main('bernoulli')
+    # main('bernoulli')

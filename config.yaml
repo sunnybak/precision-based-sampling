@@ -1,0 +1,374 @@
+response: &full_blog |
+  # Overview
+
+  In this article, we will answer the questions:
+  - how to counteract sampling bias in LLM judges?
+  - how many evaluator repetitions are enough?
+  - how does cost scale with reliability and quality?
+
+  We will use confidence intervals to quantify the required level of score precision, and sample statistics to estimate the number of samples required to achieve that precision.
+
+  We will also derive some rules-of-thumb scaling laws for how this strategy affects the time, cost, and quality of the evaluation.
+
+  - [Problem: LLM evaluators are stochastic](#problem-llm-evaluators-are-stochastic)
+  - [Sequential Sampling Algorithm](#sequential-sampling-algorithm)
+  - [Estimating the Number of Samples to Poll](#estimating-the-number-of-samples-to-poll)
+  - [Scaling Laws — how each knob changes the bottom line](#scaling-laws-how-each-knob-changes-the-bottom-line)
+  - [Impact on Time, Cost and Quality of Evaluation](#impacts-on-time-cost-and-quality-of-evaluation)
+  - [Discussion — practical knobs & tips](#discussion-practical-knobs-and-tips)
+
+  Git repo with code: [https://github.com/sunnybak/precision-based-sampling](https://github.com/sunnybak/precision-based-sampling)
+
+  ---
+
+  # Problem: LLM evaluators are stochastic
+
+  Let's say you wish to evaluate the quality of your agent's output using an LLM as a judge. You might see something as follows:
+
+  |        | evaluator 1 | evaluator 2 | evaluator 3 |
+  | ------ | ----------- | ----------- | ----------- |
+  | scores | 4           | 5           | 5           |
+
+  At face value, this might seem great. However, when you repeat the evaluators with the same prompt 5 times, the results might tell a different story
+
+  |             | evaluator 1   | evaluator 2   | evaluator 3   |
+  | ----------- | ------------- | ------------- | ------------- |
+  | scores      | 4, 4, 5, 5, 5 | 5, 4, 3, 4, 2 | 5, 4, 5, 4, 5 |
+  | mean scores | 4.6           | 3.6           | 4.6           |
+  | std scores  | 0.55          | 1.14          | 0.55          |
+
+  Evaluator 2 seems to be producing scores that have a higher variance than the other evaluators, whereas evaluator 3 seems to be more consistent. 
+
+  This does not necessarily mean that evaluator 2 is worse than evaluator 3. There are some explanations as to why evaluator 2 has more variance than evaluator 3:
+  - the metric measured by evaluator 2 is harder to grade, more subjective, or general
+  - evaluator 2 is set up to discriminate with more granularity than evaluator 3
+
+  An example of evaluator 2 could be "How well does the agent understand the user's intent?". 
+
+  Evaluator 3 could be "Is the output toxic?", a metric that is easier to grade and likely has a lower variance.
+
+  Now, let's define the problem and work through the solution step by step.
+
+  # Setup
+
+  Let's assume that an evaluator maps outputs to a 1D scalar score on a specific dimension (e.g., helpfulness, correctness, creativity).
+
+  This scalar score is then discretized into $k$ bins or classes — e.g., Likert 1–5 (5 classes), or binary "Pass/Fail" (2 classes).
+
+  Note: it's not recommended to evaluate on more than 1 dimension at a time, since the evaluator scores will likely be biased if multiple dimensions are evaluated at once.
+
+  Let's also assume that there is some objective truth to the score, and that the evaluator's score is a noisy estimate of that truth. 
+
+  If we take $n$ samples of the evaluator's score, IID, we can estimate the mean and variance of the score.
+
+  ## Precision Criteria
+  We want to keep sampling until the two-sided confidence interval half-width is $d$. In other words:
+
+  $$
+  P\left( \mu - d \leq \bar{X} \leq \mu + d \right) \geq 1 - \alpha
+  $$
+
+  For example, if we want to be 95% confident that the true mean is within $\pm d$ of the derived mean, we can set $\alpha = 0.05$.
+
+  Now let's give more thought to the value of $d$.
+
+  ## Value of the half-interval $d$
+
+  The value of $d$ must be chosen carefully to be able to distinguish between the classes. This number depends on 2 factors:
+  - the range $R$ of the scale being used 
+  - the number of bins or classes $K$ we want to sort into
+
+  The number of intervals we require are thus $R/K$. The maximum half-width to ensure no overlap between the intervals is $R/2K$. It is best practice to also leave some buffer between the intervals so that the CI sits comfortably inside its bin, and so we use thirds instead of halves. This means that our intervals are not only disjointed, but also leave some buffer between each other, increasing precision. The formula we will use is
+  $$
+  d = \frac{R}{3K}
+  $$
+  Here are some examples for different scales and their corresponding half-widths:
+
+  | Scale | Range $R$ | Classes $K$ | Half-width $d$ | Intervals                           |
+  | ----- | --------- | ----------- | -------------- | ----------------------------------- |
+  | 1-5   | 4         | 5           | 0.267          | (0.733, 1.267), (1.733, 2.267), ... |
+  | 1-10  | 9         | 10          | 0.3            | (0.7, 1.3), (1.7, 2.3), ...         |
+  | 0-1   | 1         | 3           | 0.111          | (0.899, 1.111), (1.899, 2.111), ... |
+
+  # Sequential Sampling Algorithm
+
+  The sequential sampling algorithm works by iteratively collecting samples until we achieve the desired precision. Here's how it works:
+  1. Start with a small batch of pilot samples (n0=10) to get an initial estimate of the variance
+  2. Calculate the current confidence interval half-width (h)
+  3. If h is small enough for the required precision (≤ d), we're done
+  4. Otherwise, estimate how many more samples we need based on the current variance
+  5. Collect those additional samples and repeat from step 2
+
+  The algorithm is efficient because it adapts to the variance of the data - if the evaluator is very noisy (high variance), it will collect more samples, but if the evaluator is very precise (low variance), it will collect fewer samples.
+
+  The following is a Python implementation of the sequential sampling algorithm:
+
+  ```python
+  def sample_batch(n):
+      # run the evaluator n times in parallel
+      return run_concurrently(run_evaluator, n)
+
+  def seq_sample(sample_batch, alpha, K, R):
+      n0 = 10 # number of pilot samples
+      z = st.norm.ppf(1 - alpha/2) # z-score for the confidence interval
+      x = list(sample_batch(n0)) # pilot samples
+      d = R / (3 * K) # half-width of the confidence interval
+      while True:
+          n = len(x) # number of samples so far
+          mean = np.mean(x) # sample mean
+          std = np.std(x, ddof=1) # sample standard deviation
+
+          h = z * std / np.sqrt(n) # half-width of the confidence interval
+          if h <= d:
+              # we have enough samples
+              break
+      delta = std / R # normalized sample standard deviation
+          n_req = math.ceil((3 * z * K * delta) ** 2) # number of samples required
+          n_additional = max(1, n_req - n) # number of samples to poll
+          x.extend(sample_batch(n_additional)) # poll more samples
+      return np.mean(x) # return the mean of the samples
+  ```
+
+  You can find the full implementation in the repo: [https://github.com/sunnybak/precision-based-sampling](https://github.com/sunnybak/precision-based-sampling).
+
+  # Estimating the Number of Samples to Poll
+
+  1. **CI width** (large‑$n$ normal approximation)
+  $$
+  h_n \;=\; z_{\alpha/2}\,\frac{\sigma}{\sqrt{n}}
+  $$
+  2. **Precision target** from the [one‑third‑gap rule](#value-of-the-half-interval-object-object) 
+  $$
+  d = \frac{R}{3K}, \qquad\text{where}\; R=b-a
+  $$
+  3. **Solve for $n_{req}$**
+
+  $$
+    h_n \le d
+    \;\Longrightarrow\;
+    n_{req} \;\ge\;
+    \Bigl(z_{\alpha/2}\,\frac{\sigma}{d}\Bigr)^2
+  $$
+
+  $$
+  n_{req} \;\ge\; \Bigl(z_{\alpha/2}\,\frac{3K\sigma}{R}\Bigr)^2
+  $$
+
+  Since we don't know the true standard deviation $\sigma$, we can replace it by the sample standard deviation $S$ to get the estimated number of samples required to achieve the desired precision:
+  $$
+    n_{\text{req}}
+    = \Bigl\lceil \Bigl(3 z_{\alpha/2} K \frac{S}{R}\Bigr)^2 \Bigr\rceil
+  $$
+  Let us define the normalized scale-invariant sample standard deviation as 
+  $$
+  \delta = S/R
+  $$
+  This is because we want to know the amount of variation irrespective of the scale being used. Finally, we get:
+  $$
+  n_{req} \;=\; \lceil \;9 \;z_{\alpha/2}^{2}\; K^{2}\; \delta^{2}\;\rceil
+  $$
+
+  # Scaling Laws — how each knob changes the bottom line
+  ## Expected Number of Samples
+
+  The expected number of total samples needed to achieve a $(1-\alpha)$% confidence interval, $n$, is:
+  $$
+  n \;=\; \;9 \;z_{\alpha/2}^{2}\; K^{2}\; \delta^{2}
+  $$
+  </div>
+  where 
+  - $z_{\alpha/2}$ is the z-score for the confidence level $\alpha$ (statistical confidence)
+  - $K$ is the number of bins or classes (granularity of score)
+  - $\delta$ is the normalized sample standard deviation (noisiness/discriminative power of the evaluator)
+
+  Based on this, we get the following relationships:
+
+  $$
+  n \;\propto\; z_{\alpha/2}^{2}\;\approx\; \ln(1/\alpha)
+  $$
+  $$
+  n \;\propto\; \delta^{2}
+  $$
+  $$
+  n \;\propto\; K^{2}
+  $$
+
+  1. **Confidence level $\alpha$**: Sharper CIs get expensive slowly (log‑like). 95% → 99% multiplies $n$ by only ≈ 1.7. Reliability is relatively inexpensive!
+  2. **Normalized Std‑dev $\delta$**: Halving variability quarters the required runs. If the evaluator has more variability, quadratically more samples are needed to be confident. This value is high for evaluators which produce a wider range of scores.
+  3. **Number of Bins $K$**: Increasing the number of bins $K$ for the same range will quadratically increase the number of samples required, because we want higher granularity. For example, if a 0-1 scale with 2 bins will require 6 samples, but a 0-1 scale with 4 bins will require 36 samples.
+  <br></ br>
+
+  <img src="/parameter_effects.png" alt="Parameter Effects"/>
+
+  # Impacts on Time, Cost and Quality of  Evaluation
+
+  $$
+  \text{Cost} \propto n
+  $$
+
+  $$
+  \text{Latency} \propto \frac{n}{\text{mean\_batch\_size}}
+  $$
+
+  $$
+  \text{Quality} \uparrow \text{as} \; \alpha \downarrow \text{and} \;  K \uparrow 
+  $$
+
+  1. Since the number of input and output tokens are the same, cost is directly proportional to the total number of samples, assuming constant price per token.
+  2. The latency is proportional to the number of concurrent calls made to the LLM, which is $n / \text{mean\_batch\_size}$. Increasing the minimum and maximum batch sizes will cause a faster convergence, but can lead to overshooting the number of samples required.
+  3. Quality is some function of the confidence level $\alpha$ and the half-width $d$. Lower values of $\alpha$ and $d$ will improve the reliability and granularity of the metric.
+
+
+  # Discussion — practical knobs & tips
+
+  ## Initial sample size
+  A pilot of 5-10 samples gives a tolerant first variance estimate.  If you have historical data, use its $\delta = S/R$ to seed $n_{\text{req}}$ before the first run.
+
+  ## Batch size
+  If the batch size is too large, the latency will increase - there are always some API calls that take much longer.
+  From experiments, I have found that 5-10 concurrent API calls work best for OpenAI.
+
+  Here's a latency plot for concurrent API calls for GPT-4.1
+
+  <img src="/latency_analysis.png" alt="Latency Analysis"/>
+
+  As you can see, the error bars in the latency increase with the number of concurrent API calls, pushing the mean latency up.
+
+  ## What if $n_{\text{req}}$ is still huge?
+  Depending on your use case, you might want to tune the cost, latency, or quality by adjusting $n_{\text{req}}$:
+  * Tighten the evaluator rubric so $\sigma$ drops. A more specific rubric which activates infrequently will have a lower $\sigma$.
+  * Accept 90% CIs instead of 95%.
+  * Reduce classes: 1-10 ratings -> 1-5 ratings will reduce $K$ by half and the cost by a quarter.
+
+  ## Mixed‑expert sampling
+  Given that we assume some true mean which is (theoretically) model-agnostic, one way to improve robustness is to sample from *multiple* LLMs as judges in the same batch and treat each judge's vote as another IID sample. This will lead to robustness while requiring no change to the algorithm or scaling laws.
+
+
+  ---
+
+  Git repo with code: [https://github.com/sunnybak/precision-based-sampling](https://github.com/sunnybak/precision-based-sampling)
+
+blog_overview: &blog_overview |
+  # Overview
+
+  In this article, we will answer the questions:
+  - how to counteract sampling bias in LLM judges?
+  - how many evaluator repetitions are enough?
+  - how does cost scale with reliability and quality?
+
+  We will use confidence intervals to quantify the required level of score precision, and sample statistics to estimate the number of samples required to achieve that precision.
+
+  We will also derive some rules-of-thumb scaling laws for how this strategy affects the time, cost, and quality of the evaluation.
+
+  - [Problem: LLM evaluators are stochastic](#problem-llm-evaluators-are-stochastic)
+  - [Sequential Sampling Algorithm](#sequential-sampling-algorithm)
+  - [Estimating the Number of Samples to Poll](#estimating-the-number-of-samples-to-poll)
+  - [Scaling Laws — how each knob changes the bottom line](#scaling-laws-how-each-knob-changes-the-bottom-line)
+  - [Impact on Time, Cost and Quality of Evaluation](#impacts-on-time-cost-and-quality-of-evaluation)
+  - [Discussion — practical knobs & tips](#discussion-practical-knobs-and-tips)
+
+  Git repo with code: [https://github.com/sunnybak/precision-based-sampling](https://github.com/sunnybak/precision-based-sampling)
+
+experiment_1:
+  models:
+    - openai/gpt-4o-mini
+  response: *blog_overview
+  prompt: |
+    You are an expert technical writing evaluator. Your task is to rate the quality of the following introductory paragraph from a technical blog.
+
+    Please rate the paragraph on a scale from [[{{LIKERT_SCALE_MIN}}]] (lowest) to [[{{LIKERT_SCALE_MAX}}]] (highest), where:
+      - [[{{LIKERT_SCALE_MIN}}]] = Completely incorrect, irrelevant, or harmful
+      - [[{{LIKERT_SCALE_MAX}}]] = Perfect: accurate, highly helpful, and exceptionally well-presented
+
+    When assigning your rating, carefully consider the following criteria:
+      1. Technical accuracy and depth of explanation
+      2. Quality and relevance of code examples and implementation details
+      3. Clarity and precision of technical concepts and terminology
+      4. Logical flow, coherence, and structure of the explanation
+      5. Practical value and real-world applicability
+
+    Here is the paragraph to rate:
+    [[Start of response]]
+    {{response}}
+    [[End of response]]
+
+    Please reply with ONLY a single integer between [[{{LIKERT_SCALE_MIN}}]] and [[{{LIKERT_SCALE_MAX}}]], formatted as [[number]]. Do not include any explanation or additional text. For example, if the rating is 3, you should reply with [[3]].
+
+experiment_2:
+  models:
+    - openai/gpt-4o-mini
+  response: *blog_overview
+  prompt: &prompt_2 |
+    You are an expert technical writing evaluator. Your task is to rate the quality of the following introductory paragraph from a technical blog.
+
+    Please rate the paragraph on a scale from [[{{LIKERT_SCALE_MIN}}]] (lowest) to [[{{LIKERT_SCALE_MAX}}]] (highest), where:
+      - [[{{LIKERT_SCALE_MIN}}]] = Completely incorrect, irrelevant, or harmful: The paragraph fails to address the topic, contains major technical errors, lacks clarity, and provides no practical value.
+      - [[{{ ((LIKERT_SCALE_MIN + LIKERT_SCALE_MAX) / 2) | int }}]] = Average: The paragraph is somewhat accurate and helpful, but may have some technical inaccuracies, limited depth, or issues with clarity, structure, or practical relevance.
+      - [[{{LIKERT_SCALE_MAX}}]] = Perfect: The paragraph is accurate, highly helpful, exceptionally well-presented, technically deep, clear, logically structured, and highly relevant and applicable.
+
+    Here is the paragraph to rate:
+    [[Start of response]]
+    {{response}}
+    [[End of response]]
+
+    Please reply with ONLY a single integer between [[{{LIKERT_SCALE_MIN}}]] and [[{{LIKERT_SCALE_MAX}}]], formatted as [[number]]. Do not include any explanation or additional text. For example, if the rating is 3, you should reply with [[3]].
+
+experiment_3:
+  models: &models_3
+    - openai/gpt-4o-mini
+    - openai/gpt-4o
+    - openai/gpt-4.1
+    - anthropic/claude-3-5-sonnet-20240620
+    - anthropic/claude-3-7-sonnet-20250219
+    - anthropic/claude-3-sonnet-20240229
+  response: *blog_overview
+  prompt: *prompt_2
+
+experiment_4:
+  models:
+    - openai/gpt-4o-mini
+    - openai/gpt-4o
+    - openai/gpt-4.1
+  response: *full_blog
+  prompt: &prompt_4 |
+    You are an expert technical writing evaluator. Your task is to rate the overall quality of the following technical blog post.
+
+    Please rate the blog post on a scale from [[{{LIKERT_SCALE_MIN}}]] (lowest) to [[{{LIKERT_SCALE_MAX}}]] (highest), where:
+      - [[{{LIKERT_SCALE_MIN}}]] = Completely incorrect, irrelevant, or harmful: The post fails to address the topic, contains major technical errors, lacks clarity, and provides no practical value.
+      - [[{{ ((LIKERT_SCALE_MIN + LIKERT_SCALE_MAX) / 2) | int }}]] = Average: The post is somewhat accurate and helpful, but may have some technical inaccuracies, limited depth, or issues with clarity, structure, or practical relevance.
+      - [[{{LIKERT_SCALE_MAX}}]] = Perfect: The post is accurate, highly helpful, exceptionally well-presented, technically deep, clear, logically structured, and highly relevant and applicable.
+
+    When assigning your rating, carefully consider the following criteria:
+      1. Technical accuracy and depth of explanation throughout the post
+      2. Quality, relevance, and correctness of code examples and implementation details
+      3. Clarity and precision of technical concepts and terminology
+      4. Logical flow, coherence, and structure across the entire blog post
+      5. Practical value and real-world applicability of the content
+      6. Coverage and completeness of the topic, including addressing potential limitations or edge cases
+
+    Here is the blog post to rate:
+    [[Start of response]]
+    {{response}}
+    [[End of response]]
+
+    Please reply with ONLY a single integer between [[{{LIKERT_SCALE_MIN}}]] and [[{{LIKERT_SCALE_MAX}}]], formatted as [[number]]. Do not include any explanation or additional text. For example, if the rating is 3, you should reply with [[3]].
+
+experiment_5:
+  models:
+    - openai/gpt-4o-mini
+  response: *full_blog
+  use_meta_prompt: true
+  prompt: &meta_prompt |
+    You are a prompt engineer. Your task is to write a prompt template for evaluating the quality of a technical blog post (or similar content) using a Likert scale. The generated prompt should instruct an expert evaluator (such as an LLM or human) to rate the content according to specific criteria.
+
+    Your prompt should ensure that the generated prompt includes the following elements:
+      - An introduction that clearly states the evaluator's role (e.g., "You are an expert technical writing evaluator").
+      - A request to rate the content on a Likert scale, with explicit mention of the minimum, middle, and maximum values (e.g., [[{{LIKERT_SCALE_MIN}}]], [[{{ ((LIKERT_SCALE_MIN + LIKERT_SCALE_MAX) / 2) | int }}]], [[{{LIKERT_SCALE_MAX}}]]).
+      - Descriptions for at least the lowest, middle, and highest points on the scale, with example interpretations for each.
+      - A list of evaluation criteria (such as technical accuracy, clarity, structure, practical value, etc.), but allow for some variability in the number and wording of criteria.
+      - Clear instructions on how the content to be rated will be presented (e.g., "Here is the blog post to rate: ..."). 
+      - To attach the response, use the {{response}} Jinja variable.
+      - A directive to reply with only a single integer rating, formatted in a specific way (e.g., "[[number]]"), and to avoid any explanation or extra text.
+      - An example of a valid response format.
+
+    Allow for some flexibility in the wording and order of these elements, but make sure all are present in the generated prompt. The prompt should encourage clarity, completeness, and adherence to the rating protocol.
