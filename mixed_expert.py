@@ -21,6 +21,7 @@ import asyncio
 from scipy.optimize import minimize
 from litellm import acompletion
 import konfigure
+import matplotlib.pyplot as plt
 
 import math
 from typing import Callable, List, Dict, Optional, Union
@@ -76,7 +77,10 @@ def get_likert_probs(mean: float = TRUE_MEAN,
         np.ndarray of probabilities for each Likert scale value
     """
     global likert_probs
-    if likert_probs is not None:
+    # Only use cache if we're using the default parameters
+    if (mean == TRUE_MEAN and std == TRUE_STD and 
+        scale_min == LIKERT_SCALE_MIN and scale_max == LIKERT_SCALE_MAX and 
+        likert_probs is not None):
         return likert_probs
     
     scale_size = scale_max - scale_min + 1
@@ -97,15 +101,20 @@ def get_likert_probs(mean: float = TRUE_MEAN,
     
     # Find optimal probability distribution
     result = minimize(objective, probs, method='SLSQP', bounds=bounds, constraints=constraints)
-    likert_probs = np.array(result.x)
+    computed_probs = np.array(result.x)
 
-    # Print distribution for debugging/verification
-    prob_map = {i: f"{p:.4f}" for i, p in enumerate(likert_probs, start=LIKERT_SCALE_MIN)}
-    print(f"Likert probability distribution for mean={mean:.3f} and std={std:.3f}:")
-    for value, prob in prob_map.items():
-        print(f"  {value}: {prob}")
-    print()
-    return likert_probs
+    # Only cache if using default parameters
+    if (mean == TRUE_MEAN and std == TRUE_STD and 
+        scale_min == LIKERT_SCALE_MIN and scale_max == LIKERT_SCALE_MAX):
+        likert_probs = computed_probs
+        # Print distribution for debugging/verification
+        prob_map = {i: f"{p:.4f}" for i, p in enumerate(computed_probs, start=LIKERT_SCALE_MIN)}
+        print(f"Likert probability distribution for mean={mean:.3f} and std={std:.3f}:")
+        for value, prob in prob_map.items():
+            print(f"  {value}: {prob}")
+        print()
+    
+    return computed_probs
 
 def simulate_likert(response: str) -> float:
     """Sample a single Likert scale rating from the configured distribution.
@@ -369,9 +378,196 @@ async def run_evaluation(
         print(f"Mean number of samples (1000 trials): {np.mean(n_reqs)}")
         print(f"Expected number of samples: {expected_n}")
 
+async def plot_parameter_effects(classes=9, confidence=0.95, figsize=(18, 6)):
+    """
+    Plot how distribution parameters affect the expected sample size using existing simulation functions.
+    
+    Parameters:
+    -----------
+    classes : int
+        Number of classes in the scale (default: 9)
+    confidence : float
+        Confidence level (default: 0.95)
+    figsize : tuple
+        Figure size for the plots (default: (18, 6))
+    """
+    alpha = 1 - confidence
+    z = st.norm.ppf(1 - alpha / 2)
+    
+    # Helper function to create a custom simulator with specific parameters
+    def create_custom_simulator(mean, std):
+        def custom_simulate_likert(response: str) -> float:
+            probs = get_likert_probs(mean, std, LIKERT_SCALE_MIN, LIKERT_SCALE_MAX)
+            return np.random.choice(np.arange(LIKERT_SCALE_MIN, LIKERT_SCALE_MAX + 1), size=1, p=probs)[0]
+        return custom_simulate_likert
+    
+    # Helper function to calculate theoretical expected sample size
+    def expected_sample_size(std, K, alpha):
+        z_val = st.norm.ppf(1 - alpha / 2)
+        d = R / (3 * K)  # precision target
+        return math.ceil((z_val * std / d) ** 2)
+    
+    # Create figure
+    plt.figure(figsize=figsize)
+    
+    # Plot 1: Std vs Sample Size
+    plt.subplot(1, 3, 1)
+    
+    # Range of standard deviations to test
+    stds_range = np.linspace(0.1, 2.0, 20)  # Reduced points for faster computation
+    sample_sizes = []
+    
+    print("Computing effect of standard deviation on sample size...")
+    for i, std in enumerate(stds_range):
+        print(f"Progress: {i+1}/{len(stds_range)} (std={std:.2f})")
+        
+        # Create custom simulator with this std
+        custom_simulator = create_custom_simulator(TRUE_MEAN, std)
+        
+        # Run multiple simulations to get average sample size
+        n_trials = 10  # Reduced for faster computation
+        trial_sizes = []
+        
+        for _ in range(n_trials):
+            result = await confidence_eval(
+                batch_eval=batch_eval,
+                evaluator=custom_simulator,
+                alpha=alpha,
+                K=classes,
+                R=R,
+                response="",  # Not used in simulation
+                verbose=False
+            )
+            trial_sizes.append(result['n'])
+        
+        sample_sizes.append(np.mean(trial_sizes))
+    
+    # Calculate normalized standard deviations and theoretical values
+    normalized_stds = stds_range / R  # This is delta = std/R used in the algorithm
+    theoretical_sizes = [expected_sample_size(std, classes, alpha) for std in stds_range]
+    
+    # Plot simulation results and theoretical line
+    plt.plot(normalized_stds, sample_sizes, 'b-', label='Simulation Results', linewidth=2)
+    plt.plot(normalized_stds, theoretical_sizes, 'r--', label='Expected No. Samples $n$', linewidth=2)
+    
+    plt.title(f'Effect of Normalized Standard Deviation\n(classes K = {classes}, confidence = {confidence})')
+    plt.xlabel('Normalized Standard Deviation (δ = σ/R)')
+    plt.ylabel('Expected Sample Size')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Plot 2: Effect of Confidence Intervals on Sample Size
+    plt.subplot(1, 3, 2)
+    
+    # Range of confidence levels
+    confidence_range = np.linspace(0.75, 0.99, 10)  # Reduced points for speed
+    confidence_sample_sizes = []
+    
+    print("\nComputing effect of confidence level on sample size...")
+    for i, conf in enumerate(confidence_range):
+        print(f"Progress: {i+1}/{len(confidence_range)} (confidence={conf:.3f})")
+        
+        alpha_val = 1 - conf
+        n_trials = 30  # Reduced for faster computation
+        trial_sizes = []
+        
+        for _ in range(n_trials):
+            result = await confidence_eval(
+                batch_eval=batch_eval,
+                evaluator=simulate_likert,  # Use default simulator
+                alpha=alpha_val,
+                K=classes,
+                R=R,
+                response="",
+                verbose=False
+            )
+            trial_sizes.append(result['n'])
+        
+        confidence_sample_sizes.append(np.mean(trial_sizes))
+    
+    # Calculate theoretical values for confidence levels
+    theoretical_conf_sizes = [expected_sample_size(TRUE_STD, classes, 1-conf) for conf in confidence_range]
+    
+    # Plot simulation results and theoretical line
+    plt.plot(confidence_range, confidence_sample_sizes, 'b-', label='Simulation Results', linewidth=2)
+    plt.plot(confidence_range, theoretical_conf_sizes, 'r--', label='Expected No. Samples $n$', linewidth=2)
+    
+    plt.title(f'Effect of Confidence Level\n(classes K = {classes}, std = {TRUE_STD})')
+    plt.xlabel('Confidence Level')
+    plt.ylabel('Expected Sample Size')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Add dotted vertical lines for common confidence levels
+    for conf in [0.8, 0.9, 0.95]:
+        if conf >= confidence_range.min() and conf <= confidence_range.max():
+            plt.axvline(x=conf, color='gray', linestyle=':', alpha=0.8, linewidth=2)
+            # Find the corresponding y value for labeling
+            idx = np.argmin(np.abs(confidence_range - conf))
+            y_val = confidence_sample_sizes[idx]
+            plt.text(conf+0.005, y_val+1, f"{conf:.2f}", fontsize=10, 
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+    
+    # Plot 3: Effect of number of classes K on Sample Size
+    plt.subplot(1, 3, 3)
+    
+    # Range of classes
+    class_range = np.arange(2, 16, 2)  # Reduced range for faster computation
+    class_sample_sizes = []
+    
+    print("\nComputing effect of number of classes on sample size...")
+    for i, k in enumerate(class_range):
+        print(f"Progress: {i+1}/{len(class_range)} (classes={k})")
+        
+        n_trials = 30  # Reduced for faster computation
+        trial_sizes = []
+        
+        for _ in range(n_trials):
+            result = await confidence_eval(
+                batch_eval=batch_eval,
+                evaluator=simulate_likert,  # Use default simulator
+                alpha=alpha,
+                K=k,
+                R=R,
+                response="",
+                verbose=False
+            )
+            trial_sizes.append(result['n'])
+        
+        class_sample_sizes.append(np.mean(trial_sizes))
+    
+    # Calculate theoretical values for different K values
+    theoretical_class_sizes = [expected_sample_size(TRUE_STD, k, alpha) for k in class_range]
+    
+    # Plot simulation results and theoretical line
+    plt.plot(class_range, class_sample_sizes, 'b-o', label='Simulation Results', linewidth=2, markersize=6)
+    plt.plot(class_range, theoretical_class_sizes, 'r--s', label='Expected No. Samples $n$', linewidth=2, markersize=6)
+    
+    plt.title(f'Effect of Number of Classes K\n(confidence = {confidence}, std = {TRUE_STD})')
+    plt.xlabel('Number of Classes K')
+    plt.ylabel('Expected Sample Size')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.xticks(class_range)
+    
+    plt.tight_layout()
+    
+    # Save plot
+    output_path = os.path.join(os.path.dirname(__file__), 'parameter_effects.png')
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    print(f"\nPlots saved to '{output_path}'")
+
 if __name__ == "__main__":
-    asyncio.run(run_evaluation(
-        evaluator=get_llm_response,
-        response=EXPERIMENT.response,
-        simulation=True,
-    ))
+    # You can run either the original evaluation or the parameter effects plotting
+    import sys
+    
+    if len(sys.argv) > 1 and sys.argv[1] == "plot":
+        asyncio.run(plot_parameter_effects())
+    else:
+        asyncio.run(run_evaluation(
+            evaluator=get_llm_response,
+            response=EXPERIMENT.response,
+            simulation=True,
+        ))
