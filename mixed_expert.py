@@ -364,14 +364,14 @@ async def run_evaluation(
             hs.append(result['h'])
         
         # Report simulation results
-        print(f"Grand Mean: {np.mean(means):.3f} ± {np.mean(hs):.3f}")
+        print(f"Grand Mean (1000 trials): {np.mean(means):.3f} ± {np.mean(hs):.3f}")
         print(f"True mean: {TRUE_MEAN}\n")
-        print(f"Mean number of samples: {np.mean(n_reqs)}")
-        print(f"True number of samples: {expected_n}")
+        print(f"Mean number of samples (1000 trials): {np.mean(n_reqs)}")
+        print(f"Expected number of samples: {expected_n}")
 
 if __name__ == "__main__":
     asyncio.run(run_evaluation(
         evaluator=get_llm_response,
         response=EXPERIMENT.response,
-        simulation=False,
+        simulation=True,
     ))
